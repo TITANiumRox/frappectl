@@ -7,13 +7,17 @@ from typing import Optional
 
 import typer
 
-from .. import config, oauth
+from .. import config, oauth, session_login
 from ..client import FrappeClient
+from ..config import PasswordCredential
+from ..credentials import SessionProvider
 from ..errors import FrappeError
 from ..output import emit_list, err_console, fail, get_ctx
 from ..site import SiteURL
 
 app = typer.Typer(no_args_is_help=True, help="Manage site profiles and credentials.")
+
+_AUTH_METHODS = {"oauth", "api-key", "password"}
 
 
 def _default_profile_name(site: str) -> str:
@@ -21,18 +25,26 @@ def _default_profile_name(site: str) -> str:
     return host.split(":", 1)[0]
 
 
-def _choose_oauth(use_oauth: bool) -> bool:
-    """Return the selected auth method; ``--oauth`` skips the prompt."""
+def _choose_auth_method(use_oauth: bool, use_password: bool) -> str:
+    """Return the selected auth method; an explicit flag skips the prompt.
+
+    One of ``"oauth"``, ``"api-key"`` or ``"password"``. ``--oauth`` and
+    ``--password`` are mutually exclusive.
+    """
+    if use_oauth and use_password:
+        raise fail("Choose only one of --oauth or --password.", 2)
     if use_oauth:
-        return True
+        return "oauth"
+    if use_password:
+        return "password"
     while True:
         method: str = typer.prompt(
-            "Authentication method [oauth/api-key]",
+            "Authentication method [oauth/api-key/password]",
             default="oauth",
         ).lower()
-        if method in {"oauth", "api-key"}:
-            return method == "oauth"
-        typer.echo("Choose either 'oauth' or 'api-key'.", err=True)
+        if method in _AUTH_METHODS:
+            return method
+        typer.echo("Choose 'oauth', 'api-key' or 'password'.", err=True)
 
 
 def _choose_read_only(read_only: Optional[bool]) -> bool:
@@ -69,6 +81,12 @@ def login(
         "--oauth",
         help="Log in via OAuth without showing the authentication method prompt.",
     ),
+    use_password: bool = typer.Option(
+        False,
+        "--password",
+        help="Log in with a username and password (session cookie) without "
+        "showing the authentication method prompt.",
+    ),
     client_id: Optional[str] = typer.Option(
         None,
         "--client-id",
@@ -84,13 +102,18 @@ def login(
 ) -> None:
     """Store credentials for a site in the OS keyring.
 
-    Choose OAuth browser login (the default) or API key/secret authentication.
-    API credentials are never accepted as flags or piped in, since that leaks
-    them into shell history, the process list and CI logs. OAuth runs an OAuth
-    2.0 authorization-code flow in your browser instead — no secret is ever
-    stored, and tokens refresh automatically. --oauth skips the method prompt.
+    Choose OAuth browser login (the default), API key/secret, or a
+    username/password session login. Credentials are never accepted as flags or
+    piped in, since that leaks them into shell history, the process list and CI
+    logs. OAuth runs an OAuth 2.0 authorization-code flow in your browser — no
+    secret is ever stored, and tokens refresh automatically. Password login is
+    for users who are not a System Manager and so cannot generate API keys or
+    register an OAuth client: it stores the password in the OS keyring (to renew
+    the session when it expires) and is always read-only, since session writes
+    need a CSRF token that is not yet supported. --oauth / --password skip the
+    method prompt.
 
-    Both methods need a terminal (and OAuth needs a local browser). For headless
+    All methods need a terminal (and OAuth needs a local browser). For headless
     / agent use, set FRAPPE_SITE / FRAPPE_API_KEY / FRAPPE_API_SECRET in the
     environment instead — those never touch the keyring.
     """
@@ -119,12 +142,31 @@ def login(
         description = typer.prompt(
             "Description (used by assistant mode; optional)", default=""
         )
+    method = _choose_auth_method(use_oauth, use_password)
+
+    # Password/session auth is read-only in this version: session writes need a
+    # CSRF token we do not yet issue, so force it rather than store a profile
+    # whose writes would fail confusingly at the server.
+    if method == "password":
+        if read_only is False:
+            err_console.print(
+                "[yellow]note:[/yellow] writable password profiles aren't "
+                "supported yet (session writes need a CSRF token); storing "
+                "read-only."
+            )
+        _login_password(
+            profile,
+            norm_site,
+            set_default=set_default,
+            description=description or "",
+            read_only=True,
+        )
+        return
+
     # New profiles are safe by default; --writable remains an explicit opt-out.
     read_only = _choose_read_only(read_only)
 
-    use_oauth = _choose_oauth(use_oauth)
-
-    if use_oauth:
+    if method == "oauth":
         _login_oauth(
             profile,
             norm_site,
@@ -215,19 +257,74 @@ def _login_oauth(
     except config.ConfigError as e:
         raise fail(str(e), 2)
 
-    _report_login(who, profile, read_only=read_only, oauth=True)
+    _report_login(who, profile, read_only=read_only, method="oauth")
+
+
+def _login_password(
+    profile: str,
+    norm_site: str,
+    *,
+    set_default: bool,
+    description: str,
+    read_only: bool,
+) -> None:
+    """Prompt for a username/password, verify the session, and persist it.
+
+    The password never reaches a flag or pipe; it is prompted here (hidden) and
+    stored only in the OS keyring so the session can be renewed when it expires.
+    """
+    username = typer.prompt("Username")
+    password = typer.prompt("Password", hide_input=True)
+
+    try:
+        sid = session_login.login(norm_site, username, password)
+    except session_login.SessionLoginError as e:
+        raise fail(f"Could not log in to {norm_site}: {e}")
+
+    # Verify before storing so we never persist a session we cannot use.
+    provider = SessionProvider(
+        norm_site,
+        PasswordCredential(username, password, sid),
+        session_login.login,
+        lambda _credential: None,
+    )
+    try:
+        with FrappeClient(
+            norm_site, "", token_type="session", credential_provider=provider
+        ) as client:
+            who = client.get_logged_user()
+    except FrappeError as e:
+        raise fail(f"Could not authenticate against {norm_site}: {e.message}")
+
+    try:
+        config.add_password_profile(
+            profile,
+            norm_site,
+            username,
+            password,
+            sid=sid,
+            make_default=set_default,
+            description=description,
+            read_only=read_only,
+        )
+    except config.ConfigError as e:
+        raise fail(str(e), 2)
+
+    _report_login(who, profile, read_only=read_only, method="password")
 
 
 def _report_login(
-    who: str, profile: str, *, read_only: bool, oauth: bool = False
+    who: str, profile: str, *, read_only: bool, method: str = "api-key"
 ) -> None:
     # The profile may still be the default even without --default: the very
     # first profile always becomes the default (see config.add_profile).
     _, default = config.list_profiles()
     is_default = default == profile
+    # API-key is the plain default and gets no tag; the added methods are tagged.
+    tag = f" [{method}]" if method in {"oauth", "password"} else ""
     err_console.print(
         f"[green]logged in[/green] as {who} — profile '{profile}'"
-        + (" [oauth]" if oauth else "")
+        + tag
         + (" (default)" if is_default else "")
         + (" [read-only]" if read_only else "")
     )
@@ -269,15 +366,21 @@ def logout(
 ) -> None:
     """Remove a stored profile and its credentials.
 
-    For an OAuth profile the access token is revoked on the server first
-    (best-effort) so logging out actually ends the session, not just forgets it
+    For an OAuth profile the access token is revoked on the server first, and for
+    a password profile the session is ended on the server first (both
+    best-effort) so logging out actually ends the session, not just forgets it
     locally.
     """
     profiles, _ = config.list_profiles()
-    if profiles.get(name, {}).get("auth") == "oauth":
+    auth_kind = profiles.get(name, {}).get("auth")
+    if auth_kind == "oauth":
         token = config.oauth_access_token(name)
         if token:
             oauth.revoke(str(SiteURL.parse(profiles[name]["site"])), token)
+    elif auth_kind == "password":
+        sid = config.password_sid(name)
+        if sid:
+            session_login.logout(str(SiteURL.parse(profiles[name]["site"])), sid)
     try:
         config.remove_profile(name)
     except config.ConfigError as e:
@@ -369,20 +472,25 @@ def whoami(ctx: typer.Context) -> None:
         creds = config.resolve(c.profile, interactive=c.is_tty)
     except config.ConfigError as e:
         raise fail(str(e), 2)
+    # Build the client through the factory so the right provider is armed —
+    # a session profile authenticates with a cookie, not a wire token.
     try:
-        with FrappeClient(
-            creds.site, creds.wire_token, token_type=creds.token_type
+        with c.client_factory.create(
+            c.profile, interactive=c.is_tty, debug=c.debug
         ) as client:
             user = client.get_logged_user()
     except FrappeError as e:
         raise fail(e.message)
     from ..output import emit_record
 
+    auth_label = {"bearer": "oauth", "session": "password"}.get(
+        creds.token_type, "api_key"
+    )
     record: dict[str, object] = {
         "site": creds.site,
         "user": user,
         "source": creds.source,
-        "auth": "oauth" if creds.token_type == "bearer" else "api_key",
+        "auth": auth_label,
         "description": creds.description,
         "read_only": creds.read_only,
     }

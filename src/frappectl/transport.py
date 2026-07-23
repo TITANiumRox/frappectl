@@ -36,17 +36,6 @@ _DEBUG_BODY_LIMIT = 2000
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
-def _auth_header(token_type: str, token: str) -> str:
-    """The Authorization header value for a credential.
-
-    ``"token"`` -> ``token key:secret`` (API key/secret).
-    ``"bearer"`` -> ``Bearer <access_token>`` (OAuth).
-    """
-    if token_type == "bearer":
-        return f"Bearer {token}"
-    return f"token {token}"
-
-
 class _LegacyBearerProvider:
     """Adapter for the pre-provider ``on_unauthorized`` constructor API."""
 
@@ -56,8 +45,8 @@ class _LegacyBearerProvider:
         self._token = token
         self._on_unauthorized = on_unauthorized
 
-    def authorization_header(self) -> str:
-        return _auth_header("bearer", self._token)
+    def auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
 
     def refresh(self) -> bool:
         if self._on_unauthorized is None:
@@ -108,7 +97,7 @@ class FrappeTransport:
         self._http = httpx.Client(
             base_url=self.site,
             headers={
-                "Authorization": credential_provider.authorization_header(),
+                **credential_provider.auth_headers(),
                 "Accept": "application/json",
                 "User-Agent": "frappectl",
             },
@@ -144,6 +133,13 @@ class FrappeTransport:
             if name.lower() == "authorization":
                 scheme = value.split(" ", 1)[0] if " " in value else "token"
                 value = f"{scheme} ***"
+            # The session cookie (sid) is a live credential — mask its value
+            # while keeping the cookie names visible.
+            elif name.lower() == "cookie":
+                value = "; ".join(
+                    (c.split("=", 1)[0] + "=***") if "=" in c else c
+                    for c in value.split("; ")
+                )
             self._dbg(f"  {name}: {value}")
         body = request.content
         if body:
@@ -220,9 +216,7 @@ class FrappeTransport:
         """
         if not self._credential_provider.refresh():
             return False
-        self._http.headers["Authorization"] = (
-            self._credential_provider.authorization_header()
-        )
+        self._http.headers.update(self._credential_provider.auth_headers())
         return True
 
     def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:

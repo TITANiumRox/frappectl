@@ -6,7 +6,13 @@ from functools import partial
 
 from . import config
 from .client import FrappeClient
-from .credentials import ApiKeyProvider, CredentialRefreshError, OAuthProvider
+from .credentials import (
+    ApiKeyProvider,
+    CredentialProvider,
+    CredentialRefreshError,
+    OAuthProvider,
+    SessionProvider,
+)
 from .output import ApplicationContext, fail
 
 
@@ -21,16 +27,25 @@ class ClientFactory:
             creds = self._resolver.resolve(profile, interactive=interactive)
         except config.ConfigError as e:
             raise fail(str(e), 2)
-        provider = (
-            OAuthProvider(
+        provider: CredentialProvider
+        if isinstance(creds.credential, config.OAuthCredential):
+            provider = OAuthProvider(
                 creds.site,
                 creds.credential,
                 _refresh_oauth,
                 partial(config.store_oauth_credential, creds.source),
             )
-            if isinstance(creds.credential, config.OAuthCredential)
-            else ApiKeyProvider(creds.credential.api_key, creds.credential.api_secret)
-        )
+        elif isinstance(creds.credential, config.PasswordCredential):
+            provider = SessionProvider(
+                creds.site,
+                creds.credential,
+                _login_session,
+                partial(config.store_password_credential, creds.source),
+            )
+        else:
+            provider = ApiKeyProvider(
+                creds.credential.api_key, creds.credential.api_secret
+            )
         try:
             return FrappeClient(
                 creds.site,
@@ -59,3 +74,9 @@ def _refresh_oauth(
     return config.OAuthCredential(
         tokens.access_token, tokens.refresh_token, tokens.expires_at, client_id
     )
+
+
+def _login_session(site: str, username: str, password: str) -> str:
+    from . import session_login
+
+    return session_login.login(site, username, password)

@@ -87,6 +87,23 @@ supports this by default; other sites need a pre-registered public `--client-id`
 OAuth needs a terminal and local browser, so it isn't the headless path. Use `--oauth`
 to skip the authentication-method prompt.
 
+### Username / password
+
+For users who are **not** a System Manager — and so cannot generate an API key or
+register an OAuth client — log in with the same username and password you use on the
+web. frappectl calls `/api/method/login`, keeps the returned session cookie (`sid`),
+and renews it automatically when it expires.
+
+```sh
+frappectl auth login https://erp.example.com --password
+```
+
+The password is stored in the **OS keyring** (never in a flag, pipe, or plaintext file)
+so the session can be renewed non-interactively. Password profiles are **always
+read-only**: session writes need a CSRF token that frappectl does not yet issue, so only
+`GET`/`HEAD`/`OPTIONS` requests are allowed. Use `--password` to skip the
+authentication-method prompt.
+
 ### Read-only profiles
 
 A new profile is read-only by default and refuses every unsafe HTTP method **before

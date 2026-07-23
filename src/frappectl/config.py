@@ -6,13 +6,16 @@ Resolution order for the active site/credentials:
    win. This is the headless / agent path and never touches the keyring.
 2. A stored profile (selected with ``-s/--site`` or the configured default).
    The site URL lives in a plaintext config file; the credential lives in the OS
-   keyring. Two credential shapes are supported: an API-key ``key:secret`` string
-   (the default) or, for profiles tagged ``"auth": "oauth"``, a JSON blob of
-   OAuth tokens (``see`` :mod:`frappectl.oauth`). There is **no plaintext secret
+   keyring. Three credential shapes are supported: an API-key ``key:secret``
+   string (the default), a JSON blob of OAuth tokens for profiles tagged
+   ``"auth": "oauth"`` (see :mod:`frappectl.oauth`), or a JSON blob of
+   ``{username, password, sid}`` for profiles tagged ``"auth": "password"``
+   (see :mod:`frappectl.session_login`). There is **no plaintext secret
    fallback** — a broken keyring means you must use environment variables.
 
-OAuth access tokens are short-lived. Resolution returns their stored state;
-the credential provider owns refresh timing and persistence.
+OAuth access tokens and password sessions are short-lived. Resolution returns
+their stored state; the credential provider owns refresh/renewal timing and
+persistence.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ class ConfigError(Exception):
 class AuthKind(str, Enum):
     API_KEY = "api_key"
     OAUTH = "oauth"
+    PASSWORD = "password"
 
 
 @dataclass(frozen=True)
@@ -83,7 +87,27 @@ class OAuthCredential:
         )
 
 
-StoredCredential: TypeAlias = ApiKeyCredential | OAuthCredential
+@dataclass(frozen=True)
+class PasswordCredential:
+    """A username/password login. The password is kept so an expired session can
+    be renewed non-interactively; ``sid`` caches the last session cookie."""
+
+    username: str
+    password: str
+    sid: str = ""
+
+    def serialize(self) -> str:
+        return json.dumps(
+            {
+                "username": self.username,
+                "password": self.password,
+                "sid": self.sid,
+                "auth": "password",
+            }
+        )
+
+
+StoredCredential: TypeAlias = ApiKeyCredential | OAuthCredential | PasswordCredential
 ConfigData: TypeAlias = dict[str, Any]
 
 
@@ -309,19 +333,23 @@ class ProfileRepository:
 
 
 def _profile_from_entry(name: str, entry: dict[str, Any]) -> Profile:
+    try:
+        auth = AuthKind(str(entry.get("auth", "api_key")))
+    except ValueError:
+        auth = AuthKind.API_KEY
     return Profile(
         name=name,
         site=SiteURL.parse(str(entry["site"])),
         description=str(entry.get("description", "")),
         read_only=bool(entry.get("read_only", False)),
-        auth=AuthKind.OAUTH if entry.get("auth") == "oauth" else AuthKind.API_KEY,
+        auth=auth,
     )
 
 
 def _profile_entry(profile: Profile) -> dict[str, Any]:
     entry: dict[str, Any] = {"site": str(profile.site)}
-    if profile.auth is AuthKind.OAUTH:
-        entry["auth"] = "oauth"
+    if profile.auth is not AuthKind.API_KEY:
+        entry["auth"] = profile.auth.value
     if profile.description:
         entry["description"] = profile.description
     if profile.read_only:
@@ -392,8 +420,28 @@ class Credentials:
         )
 
     @property
+    def username(self) -> str:
+        return (
+            self.credential.username
+            if isinstance(self.credential, PasswordCredential)
+            else ""
+        )
+
+    @property
+    def sid(self) -> str:
+        return (
+            self.credential.sid
+            if isinstance(self.credential, PasswordCredential)
+            else ""
+        )
+
+    @property
     def token_type(self) -> str:
-        return "bearer" if isinstance(self.credential, OAuthCredential) else "token"
+        if isinstance(self.credential, OAuthCredential):
+            return "bearer"
+        if isinstance(self.credential, PasswordCredential):
+            return "session"
+        return "token"
 
     @property
     def token(self) -> str:
@@ -401,8 +449,16 @@ class Credentials:
 
     @property
     def wire_token(self) -> str:
-        """The credential the client puts on the wire, per ``token_type``."""
-        return self.access_token if self.token_type == "bearer" else self.token
+        """The credential the client puts on the wire, per ``token_type``.
+
+        Session profiles authenticate with a cookie armed by their provider, not
+        a wire token, so there is nothing to hand the transport directly.
+        """
+        if self.token_type == "bearer":
+            return self.access_token
+        if self.token_type == "session":
+            return ""
+        return self.token
 
 
 def config_dir() -> Path:
@@ -483,13 +539,45 @@ def add_oauth_profile(
     )
 
 
+def add_password_profile(
+    name: str,
+    site: str,
+    username: str,
+    password: str,
+    sid: str = "",
+    make_default: bool = True,
+    description: str = "",
+    read_only: bool = False,
+) -> None:
+    """Store a username/password profile: a JSON credential blob in the keyring,
+    tagged ``"auth": "password"`` in the config. The blob holds
+    ``{username, password, sid}`` under the same service/name an API-key profile
+    would use; ``sid`` caches the last session cookie so later commands skip the
+    login round-trip until it expires."""
+    _repository().add(
+        Profile(name, SiteURL.parse(site), description, read_only, AuthKind.PASSWORD),
+        PasswordCredential(username, password, sid),
+        make_default=make_default,
+    )
+
+
+def store_password_credential(name: str, credential: PasswordCredential) -> None:
+    """Persist a session provider's current credential (a renewed ``sid``)."""
+    _repository().store_credential(name, credential)
+
+
+def password_sid(name: str) -> str | None:
+    """The stored session cookie for a password profile, if any (for logout)."""
+    return _read_json_blob(name).get("sid") or None
+
+
 def update_oauth_tokens(name: str, tokens: oauth.Tokens) -> None:
     """Persist refreshed OAuth tokens, preserving the stored ``client_id``.
 
     A refresh response may omit a new refresh token (Frappe reuses the old one),
     so the previous refresh token is kept when the fresh blob lacks one.
     """
-    existing = _read_oauth_blob(name)
+    existing = _read_json_blob(name)
     client_id = existing.get("client_id", "")
     if not tokens.refresh_token:
         tokens = tokens.with_refresh_token(existing.get("refresh_token", ""))
@@ -511,15 +599,15 @@ def store_oauth_credential(name: str, credential: OAuthCredential) -> None:
 
 def oauth_client_id(name: str) -> str | None:
     """The client_id stored for an OAuth profile, if any (for reuse on login)."""
-    return _read_oauth_blob(name).get("client_id") or None
+    return _read_json_blob(name).get("client_id") or None
 
 
 def oauth_access_token(name: str) -> str | None:
     """The stored OAuth access token for a profile, if any (for revocation)."""
-    return _read_oauth_blob(name).get("access_token") or None
+    return _read_json_blob(name).get("access_token") or None
 
 
-def _read_oauth_blob(name: str) -> dict[str, Any]:
+def _read_json_blob(name: str) -> dict[str, Any]:
     raw = _repository().credential(name)
     if not raw:
         return {}
@@ -637,6 +725,9 @@ def _resolve(profile: str | None = None, interactive: bool = True) -> Credential
     if profiles[name].get("auth") == "oauth":
         return _resolve_oauth(name, profiles[name])
 
+    if profiles[name].get("auth") == "password":
+        return _resolve_password(name, profiles[name])
+
     token = _repository().credential(name)
     if not token or ":" not in token:
         raise ConfigError(
@@ -655,7 +746,7 @@ def _resolve(profile: str | None = None, interactive: bool = True) -> Credential
 
 def _resolve_oauth(name: str, entry: dict[str, Any]) -> Credentials:
     """Resolve stored OAuth state; the provider owns refresh timing."""
-    blob = _read_oauth_blob(name)
+    blob = _read_json_blob(name)
     access_token = blob.get("access_token", "")
     refresh_token = blob.get("refresh_token", "")
     client_id = blob.get("client_id", "")
@@ -674,6 +765,29 @@ def _resolve_oauth(name: str, entry: dict[str, Any]) -> Credentials:
     return Credentials(
         site=site,
         credential=OAuthCredential(access_token, refresh_token, expires_at, client_id),
+        source=name,
+        description=entry.get("description", ""),
+        read_only=bool(entry.get("read_only", False)),
+    )
+
+
+def _resolve_password(name: str, entry: dict[str, Any]) -> Credentials:
+    """Resolve stored username/password state; the provider owns session renewal."""
+    blob = _read_json_blob(name)
+    username = blob.get("username", "")
+    password = blob.get("password", "")
+    sid = blob.get("sid", "")
+    site = str(SiteURL.parse(entry["site"]))
+
+    if not username or not password:
+        raise ConfigError(
+            f"No stored password credentials for profile '{name}'. "
+            f"Run 'frappectl auth login {site}' again for this site."
+        )
+
+    return Credentials(
+        site=site,
+        credential=PasswordCredential(username, password, sid),
         source=name,
         description=entry.get("description", ""),
         read_only=bool(entry.get("read_only", False)),

@@ -213,9 +213,9 @@ def test_login_defaults_authentication_choice_to_oauth(monkeypatch):
 
     monkeypatch.setattr(auth.typer, "prompt", prompt)
 
-    assert auth._choose_oauth(False) is True
+    assert auth._choose_auth_method(False, False) == "oauth"
     assert prompted == {
-        "message": "Authentication method [oauth/api-key]",
+        "message": "Authentication method [oauth/api-key/password]",
         "default": "oauth",
     }
 
@@ -223,16 +223,107 @@ def test_login_defaults_authentication_choice_to_oauth(monkeypatch):
 def test_login_can_select_api_key_authentication(monkeypatch):
     monkeypatch.setattr(auth.typer, "prompt", lambda *args, **kwargs: "api-key")
 
-    assert auth._choose_oauth(False) is False
+    assert auth._choose_auth_method(False, False) == "api-key"
+
+
+def test_login_can_select_password_authentication(monkeypatch):
+    monkeypatch.setattr(auth.typer, "prompt", lambda *args, **kwargs: "password")
+
+    assert auth._choose_auth_method(False, False) == "password"
+
+
+def _unexpected_prompt(*args, **kwargs):
+    raise AssertionError("an auth-method flag should skip the prompt")
 
 
 def test_oauth_flag_skips_authentication_choice(monkeypatch):
-    def unexpected_prompt(*args, **kwargs):
-        raise AssertionError("--oauth should skip the authentication prompt")
+    monkeypatch.setattr(auth.typer, "prompt", _unexpected_prompt)
 
-    monkeypatch.setattr(auth.typer, "prompt", unexpected_prompt)
+    assert auth._choose_auth_method(True, False) == "oauth"
 
-    assert auth._choose_oauth(True) is True
+
+def test_password_flag_skips_authentication_choice(monkeypatch):
+    monkeypatch.setattr(auth.typer, "prompt", _unexpected_prompt)
+
+    assert auth._choose_auth_method(False, True) == "password"
+
+
+def test_oauth_and_password_flags_conflict():
+    import typer
+
+    with pytest.raises(typer.Exit):
+        auth._choose_auth_method(True, True)
+
+
+@respx.mock
+def test_password_login_stores_profile_and_caches_sid(fake_config, monkeypatch):
+    prompts = iter(["alice", "s3cr3t"])
+    monkeypatch.setattr(auth.typer, "prompt", lambda *a, **k: next(prompts))
+    monkeypatch.setattr(auth.session_login, "login", lambda site, u, p: "SID123")
+    respx.get(f"{BASE}/api/v2/method/frappe.auth.get_logged_user").mock(
+        return_value=httpx.Response(200, json={"data": "alice@example.com"})
+    )
+
+    auth._login_password("acme", BASE, set_default=True, description="", read_only=True)
+
+    profiles, default = fake_config.list_profiles()
+    assert profiles["acme"]["auth"] == "password"
+    assert profiles["acme"]["read_only"] is True
+    assert default == "acme"
+    assert fake_config.password_sid("acme") == "SID123"
+    text = fake_config.config_path().read_text()
+    assert "s3cr3t" not in text
+    assert "SID123" not in text
+
+
+def test_logout_ends_password_session(fake_config, monkeypatch):
+    fake_config.add_password_profile(
+        "acme", "http://acme.test", "alice", "secret", sid="SID9"
+    )
+    called = {}
+    monkeypatch.setattr(
+        auth.session_login,
+        "logout",
+        lambda site, sid: called.update(site=site, sid=sid),
+    )
+    result = runner.invoke(app, ["auth", "logout", "acme"])
+    assert result.exit_code == 0
+    assert called == {"site": "http://acme.test", "sid": "SID9"}
+    assert "acme" not in fake_config.list_profiles()[0]
+
+
+@respx.mock
+def test_whoami_reports_password_auth(fake_config):
+    import json
+
+    fake_config.add_password_profile("acme", BASE, "alice", "secret", sid="SIDW")
+    respx.get(f"{BASE}/api/v2/method/frappe.auth.get_logged_user").mock(
+        return_value=httpx.Response(200, json={"data": "alice@example.com"})
+    )
+    result = runner.invoke(app, ["--json", "auth", "whoami"])
+    assert result.exit_code == 0
+    data = json.loads(result.stdout)
+    assert data["auth"] == "password"
+    assert data["user"] == "alice@example.com"
+
+
+@respx.mock
+def test_password_login_reports_bad_credentials(fake_config, monkeypatch):
+    import typer
+
+    prompts = iter(["alice", "wrong"])
+    monkeypatch.setattr(auth.typer, "prompt", lambda *a, **k: next(prompts))
+
+    def bad_login(site, u, p):
+        raise auth.session_login.SessionLoginError("Invalid login credentials")
+
+    monkeypatch.setattr(auth.session_login, "login", bad_login)
+
+    with pytest.raises(typer.Exit):
+        auth._login_password(
+            "acme", BASE, set_default=True, description="", read_only=True
+        )
+    assert "acme" not in fake_config.list_profiles()[0]
 
 
 def test_login_defaults_new_profile_to_read_only(monkeypatch):
