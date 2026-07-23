@@ -94,15 +94,49 @@ register an OAuth client — log in with the same username and password you use 
 web. frappectl calls `/api/method/login`, keeps the returned session cookie (`sid`),
 and renews it automatically when it expires.
 
+**1. Log in** with `--password` (skips the authentication-method prompt):
+
 ```sh
 frappectl auth login https://erp.example.com --password
 ```
 
-The password is stored in the **OS keyring** (never in a flag, pipe, or plaintext file)
-so the session can be renewed non-interactively. Password profiles are **always
-read-only**: session writes need a CSRF token that frappectl does not yet issue, so only
-`GET`/`HEAD`/`OPTIONS` requests are allowed. Use `--password` to skip the
-authentication-method prompt.
+**2. Answer the prompts.** A profile name and description come first, then your
+credentials — the password is typed hidden, never passed as a flag:
+
+```
+Profile name [erp.example.com]: erp
+Description (used by assistant mode; optional):
+Username: you@example.com
+Password:
+logged in as you@example.com — profile 'erp' [password] (default) [read-only]
+```
+
+**3. Use it.** The profile works like any other; select it per command with `-s`, or
+make it the default:
+
+```sh
+frappectl auth list                                   # 'auth' column shows: password
+frappectl -s erp doc list "ToDo" --limit 5
+frappectl auth default erp                             # make it the default profile
+frappectl auth whoami                                  # confirms auth: password
+```
+
+**4. Log out** when done — this ends the session on the server, not just locally:
+
+```sh
+frappectl auth logout erp
+```
+
+**Notes**
+
+- The username **and password** are stored in the **OS keyring** (never in a flag, pipe,
+  or plaintext file) so the session can be renewed non-interactively. If the machine has
+  no keyring there is no fallback — use another method there.
+- Password profiles are **always read-only**: session writes need a CSRF token that
+  frappectl does not yet issue, so only `GET`/`HEAD`/`OPTIONS` requests are allowed.
+  Passing `--writable` prints a note and stores the profile read-only anyway.
+- Like the other interactive logins, this needs a terminal. It is not the headless path —
+  for automation use `FRAPPE_SITE` / `FRAPPE_API_KEY` / `FRAPPE_API_SECRET`.
 
 ### Read-only profiles
 
