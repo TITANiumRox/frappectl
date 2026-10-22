@@ -49,6 +49,10 @@ You get two commands, `frappectl` and the short alias `fr`.
 
 There are four ways to give frappectl your credentials. Pick one per site.
 
+Each site gets one profile. Logging in to a site again refreshes its profile, even with
+a different method, and skips the name and description questions. To keep a second
+profile for the same site, pass `--new-profile` with a new `--name`.
+
 ### Environment variables
 
 Use these for scripts, CI and agents. They override every saved profile and frappectl

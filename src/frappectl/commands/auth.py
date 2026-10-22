@@ -87,6 +87,12 @@ def login(
         help="Log in with a username and password (session cookie) without "
         "showing the authentication method prompt.",
     ),
+    new_profile: bool = typer.Option(
+        False,
+        "--new-profile",
+        help="Add another profile for a site that already has one, instead of "
+        "refreshing the existing profile.",
+    ),
     client_id: Optional[str] = typer.Option(
         None,
         "--client-id",
@@ -133,12 +139,20 @@ def login(
     # A friendly shorthand and a description are both prompted for (with sane
     # defaults) unless supplied as flags, so a stored site is easy to pick
     # later — by a human at `auth list` or by an agent in assistant mode.
-    # A password re-login reuses the site's existing profile without asking.
-    existing = _password_profile_for(norm_site) if use_password else None
-    if existing and name is None:
+    # One profile per site: logging in again reuses it without asking, and a
+    # second profile for the same site needs --new-profile.
+    existing = None if new_profile else _profile_for_site(norm_site)
+    if existing and name not in (None, existing[0]):
+        raise fail(
+            f"Profile '{existing[0]}' already points at {norm_site}. Log in "
+            f"without --name to refresh it, or pass --new-profile to add a "
+            f"second profile for the same site.",
+            2,
+        )
+    if existing:
         name = existing[0]
-    if existing and description is None and name == existing[0]:
-        description = existing[1]
+        if description is None:
+            description = existing[1]
     profile = (
         name
         if name is not None
@@ -329,18 +343,17 @@ def _login_password(
     _report_login(who, profile, read_only=read_only, method="password")
 
 
-def _password_profile_for(norm_site: str) -> tuple[str, str] | None:
-    """The (name, description) of a saved password profile for this site.
+def _profile_for_site(norm_site: str) -> tuple[str, str] | None:
+    """The (name, description) of the saved profile for this site.
 
-    A site can have several; prefer the one with a vault password, then the one
-    named after the host.
+    Older configs can hold several; prefer the one with a vault password, then
+    the one named after the host.
     """
     profiles, _ = config.list_profiles()
     matches = [
         name
         for name, entry in profiles.items()
-        if entry.get("auth") == "password"
-        and str(SiteURL.parse(entry["site"])) == norm_site
+        if str(SiteURL.parse(entry["site"])) == norm_site
     ]
     if not matches:
         return None

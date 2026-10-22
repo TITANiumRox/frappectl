@@ -411,7 +411,52 @@ def test_password_relogin_picks_vaulted_then_host_named_profile(
     stored = {vaulted: (BASE, "alice", "pw")} if vaulted else {}
     FakeVault(stored).install(monkeypatch)
 
-    assert auth._password_profile_for(BASE)[0] == expected
+    assert auth._profile_for_site(BASE)[0] == expected
+
+
+@pytest.fixture
+def tty_login(fake_config, monkeypatch):
+    monkeypatch.setattr(
+        auth, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True))
+    )
+    calls = []
+    monkeypatch.setattr(
+        auth, "_login_password", lambda profile, *a, **k: calls.append(profile)
+    )
+    return calls
+
+
+def test_login_refuses_second_profile_for_same_site(fake_config, tty_login):
+    fake_config.add_password_profile("erp", BASE, "alice", "", sid="S")
+
+    result = runner.invoke(app, ["auth", "login", BASE, "--password", "--name", "x"])
+
+    assert result.exit_code == 2
+    assert "--new-profile" in result.output
+    assert tty_login == []
+
+
+def test_login_with_new_profile_adds_second_profile(
+    fake_config, tty_login, monkeypatch
+):
+    fake_config.add_password_profile("erp", BASE, "alice", "", sid="S")
+    _answers(monkeypatch, prompts=[""])
+
+    result = runner.invoke(
+        app, ["auth", "login", BASE, "--password", "--name", "x", "--new-profile"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert tty_login == ["x"]
+
+
+def test_login_reuses_profile_across_auth_methods(fake_config, tty_login):
+    fake_config.add_profile("erp", BASE, "k", "s", description="ERP")
+
+    result = runner.invoke(app, ["auth", "login", BASE, "--password"])
+
+    assert result.exit_code == 0, result.output
+    assert tty_login == ["erp"]
 
 
 def test_password_login_needs_the_vault_installed(fake_config, monkeypatch):
