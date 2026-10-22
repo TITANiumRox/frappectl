@@ -7,7 +7,7 @@ from typing import Optional
 
 import typer
 
-from .. import config, oauth, session_login
+from .. import config, oauth, session_login, vault
 from ..client import FrappeClient
 from ..config import PasswordCredential
 from ..credentials import SessionProvider
@@ -108,8 +108,8 @@ def login(
     logs. OAuth runs an OAuth 2.0 authorization-code flow in your browser — no
     secret is ever stored, and tokens refresh automatically. Password login is
     for users who are not a System Manager and so cannot generate API keys or
-    register an OAuth client: it stores the password in the OS keyring (to renew
-    the session when it expires) and is always read-only, since session writes
+    register an OAuth client: the password lives in a root-owned vault that
+    needs your fingerprint to use (see 'auth vault-setup') and is always read-only, since session writes
     need a CSRF token that is not yet supported. --oauth / --password skip the
     method prompt.
 
@@ -268,24 +268,34 @@ def _login_password(
     description: str,
     read_only: bool,
 ) -> None:
-    """Prompt for a username/password, verify the session, and persist it.
+    """Log in with the password stored in the fingerprint-gated vault.
 
-    The password never reaches a flag or pipe; it is prompted here (hidden) and
-    stored only in the OS keyring so the session can be renewed when it expires.
+    A stored password is used as-is; a failed login offers to update it, and a
+    missing one offers to add it. The password is never kept in the keyring.
     """
-    username = typer.prompt("Username")
-    password = typer.prompt("Password", hide_input=True)
-
+    if not vault.is_installed():
+        raise fail(
+            "The password vault is not installed. Run 'frappectl auth vault-setup' "
+            "and run the commands it prints.",
+            2,
+        )
     try:
-        sid = session_login.login(norm_site, username, password)
-    except session_login.SessionLoginError as e:
-        raise fail(f"Could not log in to {norm_site}: {e}")
+        if vault.has_password(profile):
+            username, sid = _login_from_vault(profile, norm_site)
+        elif typer.confirm(
+            f"No stored password for '{profile}'. Add one?", default=True
+        ):
+            username, sid = _add_to_vault(profile, norm_site)
+        else:
+            raise fail("No stored password to log in with.")
+    except vault.VaultError as e:
+        raise fail(str(e))
 
     # Verify before storing so we never persist a session we cannot use.
     provider = SessionProvider(
         norm_site,
-        PasswordCredential(username, password, sid),
-        session_login.login,
+        PasswordCredential(username, "", sid),
+        _no_relogin,
         lambda _credential: None,
     )
     try:
@@ -301,7 +311,7 @@ def _login_password(
             profile,
             norm_site,
             username,
-            password,
+            "",
             sid=sid,
             make_default=set_default,
             description=description,
@@ -311,6 +321,40 @@ def _login_password(
         raise fail(str(e), 2)
 
     _report_login(who, profile, read_only=read_only, method="password")
+
+
+def _login_from_vault(profile: str, norm_site: str) -> tuple[str, str]:
+    try:
+        stored = vault.login(profile)
+    except vault.VaultBadCredentials as e:
+        err_console.print(f"[red]Login failed:[/red] {e}")
+        if not typer.confirm("Update the stored password?", default=True):
+            raise fail("Login failed.")
+        return _add_to_vault(profile, norm_site)
+    if stored.site.rstrip("/") != norm_site.rstrip("/"):
+        err_console.print(
+            f"[yellow]note:[/yellow] the stored password is for {stored.site}."
+        )
+        if not typer.confirm(f"Replace it with one for {norm_site}?", default=False):
+            raise fail("Login cancelled.")
+        return _add_to_vault(profile, norm_site)
+    return stored.username, stored.sid
+
+
+def _add_to_vault(profile: str, norm_site: str) -> tuple[str, str]:
+    """Prompt for credentials, check them against the site, then store them."""
+    username = typer.prompt("Username")
+    password = typer.prompt("Password", hide_input=True)
+    try:
+        sid = session_login.login(norm_site, username, password)
+    except session_login.SessionLoginError as e:
+        raise fail(f"Could not log in to {norm_site}: {e}")
+    vault.store(profile, norm_site, username, password)
+    return username, sid
+
+
+def _no_relogin(site: str, username: str, password: str) -> str:
+    raise session_login.SessionLoginError("The new session was rejected.")
 
 
 def _report_login(
@@ -381,11 +425,31 @@ def logout(
         sid = config.password_sid(name)
         if sid:
             session_login.logout(str(SiteURL.parse(profiles[name]["site"])), sid)
+        _forget_vault_password(name)
     try:
         config.remove_profile(name)
     except config.ConfigError as e:
         raise fail(str(e), 2)
     err_console.print(f"[green]removed[/green] profile '{name}'")
+
+
+def _forget_vault_password(name: str) -> None:
+    try:
+        if vault.has_password(name):
+            vault.delete(name)
+    except vault.VaultError as e:
+        err_console.print(f"[yellow]note:[/yellow] stored password kept: {e}")
+
+
+@app.command("vault-setup")
+def vault_setup() -> None:
+    """Print the root commands that install the fingerprint-gated password vault.
+
+    Read the helper first, then run the commands yourself; frappectl never
+    escalates on your behalf.
+    """
+    for line in vault.setup_commands():
+        typer.echo(line)
 
 
 @app.command("default")

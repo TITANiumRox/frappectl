@@ -89,22 +89,21 @@ class OAuthCredential:
 
 @dataclass(frozen=True)
 class PasswordCredential:
-    """A username/password login. The password is kept so an expired session can
-    be renewed non-interactively; ``sid`` caches the last session cookie."""
+    """A username/password login; ``sid`` caches the last session cookie.
+
+    An empty ``password`` means it lives in the fingerprint-gated vault (see
+    :mod:`frappectl.vault`); older profiles still carry it here.
+    """
 
     username: str
     password: str
     sid: str = ""
 
     def serialize(self) -> str:
-        return json.dumps(
-            {
-                "username": self.username,
-                "password": self.password,
-                "sid": self.sid,
-                "auth": "password",
-            }
-        )
+        blob = {"username": self.username, "sid": self.sid, "auth": "password"}
+        if self.password:
+            blob["password"] = self.password
+        return json.dumps(blob)
 
 
 StoredCredential: TypeAlias = ApiKeyCredential | OAuthCredential | PasswordCredential
@@ -779,7 +778,7 @@ def _resolve_password(name: str, entry: dict[str, Any]) -> Credentials:
     sid = blob.get("sid", "")
     site = str(SiteURL.parse(entry["site"]))
 
-    if not username or not password:
+    if not username:
         raise ConfigError(
             f"No stored password credentials for profile '{name}'. "
             f"Run 'frappectl auth login {site}' again for this site."

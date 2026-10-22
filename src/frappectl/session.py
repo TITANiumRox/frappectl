@@ -39,7 +39,9 @@ class ClientFactory:
             provider = SessionProvider(
                 creds.site,
                 creds.credential,
-                _login_session,
+                _login_session
+                if creds.credential.password
+                else partial(_login_vault, creds.source),
                 partial(config.store_password_credential, creds.source),
             )
         else:
@@ -80,3 +82,12 @@ def _login_session(site: str, username: str, password: str) -> str:
     from . import session_login
 
     return session_login.login(site, username, password)
+
+
+def _login_vault(profile: str, site: str, username: str, password: str) -> str:
+    from . import vault
+
+    stored = vault.login(profile)
+    if stored.site.rstrip("/") != site.rstrip("/"):
+        raise vault.VaultError(f"The stored password is for {stored.site}, not {site}.")
+    return stored.sid

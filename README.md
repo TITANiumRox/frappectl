@@ -94,18 +94,30 @@ register an OAuth client — log in with the same username and password you use 
 web. frappectl calls `/api/method/login`, keeps the returned session cookie (`sid`),
 and renews it automatically when it expires.
 
+**0. Install the password vault (once per machine).** The password is kept in a
+root-owned vault that needs your fingerprint (Linux, via polkit + fprintd) or Touch ID
+(macOS, via `sudo` + `pam_tid`) to use, so nothing running as you can read it. Print
+the install commands, read `frappectl/vault_helper/frappectl_vault.py`, then run them:
+
+```sh
+frappectl auth vault-setup
+```
+
 **1. Log in** with `--password` (skips the authentication-method prompt):
 
 ```sh
 frappectl auth login https://erp.example.com --password
 ```
 
-**2. Answer the prompts.** A profile name and description come first, then your
-credentials — the password is typed hidden, never passed as a flag:
+**2. Answer the prompts.** A profile name and description come first. If the vault
+already holds a password for the profile, frappectl asks for your fingerprint and logs
+in with it; if that login fails it offers to update the password. If there is none yet,
+it offers to add one — the password is typed hidden, never passed as a flag:
 
 ```
 Profile name [erp.example.com]: erp
 Description (used by assistant mode; optional):
+No stored password for 'erp'. Add one? [Y/n]:
 Username: you@example.com
 Password:
 logged in as you@example.com — profile 'erp' [password] (default) [read-only]
@@ -129,9 +141,10 @@ frappectl auth logout erp
 
 **Notes**
 
-- The username **and password** are stored in the **OS keyring** (never in a flag, pipe,
-  or plaintext file) so the session can be renewed non-interactively. If the machine has
-  no keyring there is no fallback — use another method there.
+- The password lives only in the vault; the OS keyring holds the username and session
+  cookie. While the session is valid nothing prompts; when it expires, the next command
+  asks for your fingerprint to log in again. The vault returns a session, never the
+  password. Logging out also removes the stored password.
 - Password profiles are **always read-only**: session writes need a CSRF token that
   frappectl does not yet issue, so only `GET`/`HEAD`/`OPTIONS` requests are allowed.
   Passing `--writable` prints a note and stores the profile read-only anyway.

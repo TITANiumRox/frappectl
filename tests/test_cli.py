@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 import respx
+import typer
 from typer.testing import CliRunner
 
 from frappectl.cli import _hoist_globals, app
@@ -255,25 +256,137 @@ def test_oauth_and_password_flags_conflict():
         auth._choose_auth_method(True, True)
 
 
-@respx.mock
-def test_password_login_stores_profile_and_caches_sid(fake_config, monkeypatch):
-    prompts = iter(["alice", "s3cr3t"])
+class FakeVault:
+    def __init__(self, stored=None, login_error=None):
+        self.stored = dict(stored or {})
+        self.login_error = login_error
+        self.deleted = []
+
+    def install(self, monkeypatch):
+        monkeypatch.setattr(auth.vault, "is_installed", lambda: True)
+        monkeypatch.setattr(auth.vault, "has_password", lambda p: p in self.stored)
+        monkeypatch.setattr(auth.vault, "store", self.store)
+        monkeypatch.setattr(auth.vault, "login", self.login)
+        monkeypatch.setattr(auth.vault, "delete", self.deleted.append)
+        return self
+
+    def store(self, profile, site, username, password):
+        self.stored[profile] = (site, username, password)
+        self.login_error = None
+
+    def login(self, profile):
+        if self.login_error:
+            raise self.login_error
+        site, username, _ = self.stored[profile]
+        return auth.vault.VaultLogin("VAULTSID", site, username)
+
+
+@pytest.fixture
+def whoami():
+    with respx.mock:
+        respx.get(f"{BASE}/api/v2/method/frappe.auth.get_logged_user").mock(
+            return_value=httpx.Response(200, json={"data": "alice@example.com"})
+        )
+        yield
+
+
+def _answers(monkeypatch, prompts=(), confirms=()):
+    prompts, confirms = iter(prompts), iter(confirms)
     monkeypatch.setattr(auth.typer, "prompt", lambda *a, **k: next(prompts))
-    monkeypatch.setattr(auth.session_login, "login", lambda site, u, p: "SID123")
-    respx.get(f"{BASE}/api/v2/method/frappe.auth.get_logged_user").mock(
-        return_value=httpx.Response(200, json={"data": "alice@example.com"})
+    monkeypatch.setattr(auth.typer, "confirm", lambda *a, **k: next(confirms))
+
+
+def _login(profile="acme"):
+    auth._login_password(
+        profile, BASE, set_default=True, description="", read_only=True
     )
 
-    auth._login_password("acme", BASE, set_default=True, description="", read_only=True)
+
+def test_password_login_uses_stored_vault_password(fake_config, monkeypatch, whoami):
+    fake = FakeVault({"acme": (BASE, "alice", "s3cr3t")}).install(monkeypatch)
+    _answers(monkeypatch)
+
+    _login()
 
     profiles, default = fake_config.list_profiles()
     assert profiles["acme"]["auth"] == "password"
     assert profiles["acme"]["read_only"] is True
     assert default == "acme"
+    assert fake_config.password_sid("acme") == "VAULTSID"
+    assert "password" not in fake_config._read_json_blob("acme")
+    assert fake.stored["acme"][2] == "s3cr3t"
+
+
+def test_password_login_adds_missing_password_to_vault(
+    fake_config, monkeypatch, whoami
+):
+    fake = FakeVault().install(monkeypatch)
+    _answers(monkeypatch, prompts=["alice", "s3cr3t"], confirms=[True])
+    monkeypatch.setattr(auth.session_login, "login", lambda site, u, p: "SID123")
+
+    _login()
+
+    assert fake.stored["acme"] == (BASE, "alice", "s3cr3t")
     assert fake_config.password_sid("acme") == "SID123"
-    text = fake_config.config_path().read_text()
-    assert "s3cr3t" not in text
-    assert "SID123" not in text
+    blob = fake_config._read_json_blob("acme")
+    assert "password" not in blob
+    assert "s3cr3t" not in fake_config.config_path().read_text()
+
+
+def test_password_login_declining_to_add_stores_nothing(fake_config, monkeypatch):
+    fake = FakeVault().install(monkeypatch)
+    _answers(monkeypatch, confirms=[False])
+
+    with pytest.raises(typer.Exit):
+        _login()
+    assert fake.stored == {}
+    assert "acme" not in fake_config.list_profiles()[0]
+
+
+def test_failed_vault_login_offers_to_update_password(fake_config, monkeypatch, whoami):
+    fake = FakeVault(
+        {"acme": (BASE, "alice", "old")},
+        login_error=auth.vault.VaultBadCredentials("Invalid login credentials"),
+    ).install(monkeypatch)
+    _answers(monkeypatch, prompts=["alice", "new"], confirms=[True])
+    monkeypatch.setattr(auth.session_login, "login", lambda site, u, p: "SIDNEW")
+
+    _login()
+
+    assert fake.stored["acme"] == (BASE, "alice", "new")
+    assert fake_config.password_sid("acme") == "SIDNEW"
+
+
+def test_failed_vault_login_declining_update_fails(fake_config, monkeypatch):
+    FakeVault(
+        {"acme": (BASE, "alice", "old")},
+        login_error=auth.vault.VaultBadCredentials("Invalid login credentials"),
+    ).install(monkeypatch)
+    _answers(monkeypatch, confirms=[False])
+
+    with pytest.raises(typer.Exit):
+        _login()
+    assert "acme" not in fake_config.list_profiles()[0]
+
+
+def test_cancelled_fingerprint_fails_login(fake_config, monkeypatch):
+    FakeVault(
+        {"acme": (BASE, "alice", "pw")},
+        login_error=auth.vault.VaultCancelled("cancelled"),
+    ).install(monkeypatch)
+    _answers(monkeypatch)
+
+    with pytest.raises(typer.Exit):
+        _login()
+    assert "acme" not in fake_config.list_profiles()[0]
+
+
+def test_password_login_needs_the_vault_installed(fake_config, monkeypatch):
+    monkeypatch.setattr(auth.vault, "is_installed", lambda: False)
+
+    with pytest.raises(typer.Exit) as exc:
+        _login()
+    assert exc.value.exit_code == 2
 
 
 def test_logout_ends_password_session(fake_config, monkeypatch):
@@ -286,9 +399,11 @@ def test_logout_ends_password_session(fake_config, monkeypatch):
         "logout",
         lambda site, sid: called.update(site=site, sid=sid),
     )
+    fake = FakeVault({"acme": ("http://acme.test", "alice", "pw")}).install(monkeypatch)
     result = runner.invoke(app, ["auth", "logout", "acme"])
     assert result.exit_code == 0
     assert called == {"site": "http://acme.test", "sid": "SID9"}
+    assert fake.deleted == ["acme"]
     assert "acme" not in fake_config.list_profiles()[0]
 
 
@@ -307,12 +422,9 @@ def test_whoami_reports_password_auth(fake_config):
     assert data["user"] == "alice@example.com"
 
 
-@respx.mock
-def test_password_login_reports_bad_credentials(fake_config, monkeypatch):
-    import typer
-
-    prompts = iter(["alice", "wrong"])
-    monkeypatch.setattr(auth.typer, "prompt", lambda *a, **k: next(prompts))
+def test_new_password_rejected_by_site_is_not_stored(fake_config, monkeypatch):
+    fake = FakeVault().install(monkeypatch)
+    _answers(monkeypatch, prompts=["alice", "wrong"], confirms=[True])
 
     def bad_login(site, u, p):
         raise auth.session_login.SessionLoginError("Invalid login credentials")
@@ -320,9 +432,8 @@ def test_password_login_reports_bad_credentials(fake_config, monkeypatch):
     monkeypatch.setattr(auth.session_login, "login", bad_login)
 
     with pytest.raises(typer.Exit):
-        auth._login_password(
-            "acme", BASE, set_default=True, description="", read_only=True
-        )
+        _login()
+    assert fake.stored == {}
     assert "acme" not in fake_config.list_profiles()[0]
 
 
