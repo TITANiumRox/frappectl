@@ -128,14 +128,15 @@ def login(record: Dict[str, str]) -> str:
     request = urllib.request.Request(
         f"{site}/api/method/login",
         data=body,
-        headers={"Accept": "application/json"},
+        # Cloudflare (error 1010) blocks urllib's default User-Agent.
+        headers={"Accept": "application/json", "User-Agent": "frappectl-vault"},
     )
     try:
         with opener.open(request, timeout=_TIMEOUT) as resp:
             resp.read()
     except urllib.error.HTTPError as e:
         message = _server_message(e.read()) or f"Login failed with HTTP {e.code}."
-        code = EXIT_BAD_CREDENTIALS if e.code in (401, 403) else EXIT_ERROR
+        code = EXIT_BAD_CREDENTIALS if e.code == 401 else EXIT_ERROR
         raise VaultError(message, code)
     except (urllib.error.URLError, OSError) as e:
         raise VaultError(f"Could not reach {site}: {e}")

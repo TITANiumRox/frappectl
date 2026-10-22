@@ -22,7 +22,13 @@ def site():
             body = parse_qs(
                 self.rfile.read(int(self.headers["Content-Length"])).decode()
             )
-            if body == {"usr": ["alice"], "pwd": ["right"]}:
+            if self.headers["User-Agent"].startswith("Python-urllib"):
+                self.send_response(403)
+                payload = {"type": "cloudflare-1010"}
+            elif body == {"usr": ["alice"], "pwd": ["blocked"]}:
+                self.send_response(403)
+                payload = {"message": "Not permitted"}
+            elif body == {"usr": ["alice"], "pwd": ["right"]}:
                 self.send_response(200)
                 self.send_header("Set-Cookie", "sid=SID42; Path=/")
                 payload = {"message": "Logged In"}
@@ -73,6 +79,15 @@ def test_login_with_wrong_password_is_bad_credentials(tmp_path, site):
         _run(tmp_path, "login", "acme")
     assert exc.value.code == helper.EXIT_BAD_CREDENTIALS
     assert "Invalid login credentials" in str(exc.value)
+
+
+def test_forbidden_login_is_an_error_not_bad_credentials(tmp_path, site):
+    record = {"site": site, "username": "alice", "password": "blocked"}
+    _run(tmp_path, "store", "acme", stdin=json.dumps(record))
+
+    with pytest.raises(helper.VaultError) as exc:
+        _run(tmp_path, "login", "acme")
+    assert exc.value.code == helper.EXIT_ERROR
 
 
 def test_login_and_delete_report_missing_entry(tmp_path):
