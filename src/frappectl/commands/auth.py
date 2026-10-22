@@ -133,6 +133,12 @@ def login(
     # A friendly shorthand and a description are both prompted for (with sane
     # defaults) unless supplied as flags, so a stored site is easy to pick
     # later — by a human at `auth list` or by an agent in assistant mode.
+    # A password re-login reuses the site's existing profile without asking.
+    existing = _password_profile_for(norm_site) if use_password else None
+    if existing and name is None:
+        name = existing[0]
+    if existing and description is None and name == existing[0]:
+        description = existing[1]
     profile = (
         name
         if name is not None
@@ -321,6 +327,36 @@ def _login_password(
         raise fail(str(e), 2)
 
     _report_login(who, profile, read_only=read_only, method="password")
+
+
+def _password_profile_for(norm_site: str) -> tuple[str, str] | None:
+    """The (name, description) of a saved password profile for this site.
+
+    A site can have several; prefer the one with a vault password, then the one
+    named after the host.
+    """
+    profiles, _ = config.list_profiles()
+    matches = [
+        name
+        for name, entry in profiles.items()
+        if entry.get("auth") == "password"
+        and str(SiteURL.parse(entry["site"])) == norm_site
+    ]
+    if not matches:
+        return None
+    host_name = _default_profile_name(norm_site)
+    best = next(
+        (name for name in matches if _in_vault(name)),
+        host_name if host_name in matches else matches[0],
+    )
+    return best, profiles[best].get("description", "")
+
+
+def _in_vault(profile: str) -> bool:
+    try:
+        return vault.has_password(profile)
+    except vault.VaultError:
+        return False
 
 
 def _login_from_vault(profile: str, norm_site: str) -> tuple[str, str]:

@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -379,6 +380,38 @@ def test_cancelled_fingerprint_fails_login(fake_config, monkeypatch):
     with pytest.raises(typer.Exit):
         _login()
     assert "acme" not in fake_config.list_profiles()[0]
+
+
+def test_password_relogin_reuses_profile_without_prompting(
+    fake_config, monkeypatch, whoami
+):
+    fake_config.add_password_profile(
+        "erp", BASE, "alice", "", sid="OLD", description="ERP site"
+    )
+    FakeVault({"erp": (BASE, "alice", "pw")}).install(monkeypatch)
+    tty = SimpleNamespace(isatty=lambda: True)
+    monkeypatch.setattr(auth, "sys", SimpleNamespace(stdin=tty))
+    _answers(monkeypatch)
+
+    result = runner.invoke(app, ["auth", "login", BASE, "--password"])
+
+    assert result.exit_code == 0, result.output
+    profiles, _ = fake_config.list_profiles()
+    assert list(profiles) == ["erp"]
+    assert profiles["erp"]["description"] == "ERP site"
+    assert fake_config.password_sid("erp") == "VAULTSID"
+
+
+@pytest.mark.parametrize("vaulted,expected", [("zz", "zz"), ("", "localhost")])
+def test_password_relogin_picks_vaulted_then_host_named_profile(
+    fake_config, monkeypatch, vaulted, expected
+):
+    for name in ("aa", "localhost", "zz"):
+        fake_config.add_password_profile(name, BASE, "alice", "", sid="S")
+    stored = {vaulted: (BASE, "alice", "pw")} if vaulted else {}
+    FakeVault(stored).install(monkeypatch)
+
+    assert auth._password_profile_for(BASE)[0] == expected
 
 
 def test_password_login_needs_the_vault_installed(fake_config, monkeypatch):
